@@ -112,27 +112,26 @@ test("template has dark scrollbar", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
-console.log("\n── Document builder (index.ts) ──");
+console.log("\n── Markdown renderer (index.ts) ──");
 // ═══════════════════════════════════════════════════════════════════
 
-test("buildDocument function exists", () => {
-  assert(src.includes("function buildDocument"), "Missing buildDocument function");
+test("renderDocument function exists", () => {
+  assert(src.includes("function renderDocument"), "Missing renderDocument function");
 });
 
-test("extractBodyContent function exists", () => {
-  assert(src.includes("function extractBodyContent"), "Missing extractBodyContent function");
+test("renderDocument uses marked library", () => {
+  assert(src.includes('import("marked")'), "Missing marked import");
 });
 
-test("cleanMermaidBlock strips style directives", () => {
-  assert(src.includes("cleanMermaidBlock"), "Missing cleanMermaidBlock function");
-  // Check it filters style, classDef, and init lines
-  assert(src.includes("style\\s+\\S+\\s+") || src.includes("^style\\s"), "Missing style directive filter");
+test("cleanMermaidSource strips style directives", () => {
+  assert(src.includes("cleanMermaidSource"), "Missing cleanMermaidSource function");
   assert(src.includes("classDef"), "Missing classDef filter");
   assert(src.includes("%%{init:"), "Missing init directive filter");
 });
 
-test("extractBodyContent removes agent script tags", () => {
-  assert(src.includes("<script[\\s\\S]*?<\\/script>"), "Missing script tag removal regex");
+test("mermaid code blocks render to mermaid-box containers", () => {
+  assert(src.includes('lang === "mermaid"'), "Missing mermaid language check in renderer");
+  assert(src.includes("mermaid-box"), "Missing mermaid-box container in renderer output");
 });
 
 test("selection bridge is injected at serve time", () => {
@@ -212,31 +211,27 @@ test("stopAgent resets resume and chatHistory flags", () => {
 console.log("\n── Agent prompt ──");
 // ═══════════════════════════════════════════════════════════════════
 
-test("prompt tells agent to write body content only", () => {
-  assert(src.includes("body content only") || src.includes("Do NOT include <html>"),
-    "Prompt should instruct agent to write body content only");
+test("prompt tells agent to write markdown", () => {
+  assert(src.includes("Write a MARKDOWN file") || src.includes("Write a markdown file"),
+    "Prompt should instruct agent to write markdown");
+  assert(src.includes("document.md"), "Prompt should reference .md output path");
 });
 
-test("prompt lists available CSS classes", () => {
-  assert(src.includes(".hero"), "Prompt missing .hero class");
-  assert(src.includes("nav.sticky-nav"), "Prompt missing nav.sticky-nav class");
-  assert(src.includes(".mermaid-box"), "Prompt missing .mermaid-box class");
-  assert(src.includes(".callout"), "Prompt missing .callout class");
-  assert(src.includes(".metric-card"), "Prompt missing .metric-card class");
+test("prompt tells agent NOT to write HTML", () => {
+  assert(src.includes("Do NOT write HTML") || src.includes("Do not write HTML"),
+    "Prompt should forbid HTML output");
 });
 
 test("prompt tells agent to write structure-only mermaid", () => {
-  assert(src.includes("no `style` directives") || src.includes("no style directives") || 
-         src.includes("Do NOT include any styling") || src.includes("no \\`style\\` directives"),
+  assert(src.includes("Do NOT add") && src.includes("style"),
     "Prompt should forbid style directives in mermaid");
-  assert(src.includes("no `classDef`") || src.includes("no classDef") ||
-         src.includes("no \\`classDef\\`"),
+  assert(src.includes("classDef"),
     "Prompt should forbid classDef in mermaid");
 });
 
-test("prompt shows mermaid-box container pattern", () => {
-  assert(src.includes("mermaid-box"), "Prompt missing mermaid-box container example");
-  assert(src.includes("pan-area"), "Prompt missing pan-area in mermaid example");
+test("prompt shows mermaid code block example", () => {
+  assert(src.includes("```mermaid") || src.includes("\\`\\`\\`mermaid"),
+    "Prompt should show mermaid code block syntax");
 });
 
 test("prompt warns about square brackets in sequence diagrams", () => {

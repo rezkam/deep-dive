@@ -29,8 +29,8 @@ import { Box, Text } from "@mariozechner/pi-tui";
 const MERMAID_CLI_VERSION = "11.4.2";  // @mermaid-js/mermaid-cli — used for npx validation only
 // highlight.js version managed in template.html — no longer referenced here
 
-// Template for generated HTML documents — owns all CDN deps, CSS, mermaid theme.
-// The agent writes body content only; buildDocument() wraps it in this template.
+// Template for rendered HTML documents — owns all CDN deps, CSS, mermaid theme.
+// The agent writes markdown; renderDocument() converts it and wraps in this template.
 const TEMPLATE_PATH = path.join(path.dirname(new URL(import.meta.url).pathname), "template.html");
 let _templateCache: string | null = null;
 function getTemplate(): string {
@@ -295,64 +295,53 @@ function rpcSend(cmd: Record<string, unknown>) {
 // Post-write document sanitization — fix CDN URLs and ensure dependencies
 // ═══════════════════════════════════════════════════════════════════════
 
-// CDN URLs now live in template.html — the single source of truth
-
 // ═══════════════════════════════════════════════════════════════════════
-// Document builder — extracts body content from agent HTML, wraps in template
+// Markdown → HTML renderer
 // ═══════════════════════════════════════════════════════════════════════
 
-/**
- * Strip style/color directives from mermaid diagram source.
- * The template's mermaid.initialize() handles all theming centrally.
- * Agents must only write graph structure (nodes, edges, subgraphs).
- */
-function cleanMermaidBlock(code: string): string {
-	return code
-		.split("\n")
-		.filter(line => !line.trim().match(/^style\s+\S+\s+/))       // remove `style NodeA fill:...`
-		.filter(line => !line.trim().match(/^%%\{init:/))              // remove %%{init:...}%%
-		.filter(line => !line.trim().match(/^classDef\s+/))            // remove classDef
-		.filter(line => !line.trim().match(/^class\s+\S+\s+\S+$/))    // remove class assignments
-		.join("\n");
+let _marked: typeof import("marked") | null = null;
+async function getMarked() {
+	if (!_marked) _marked = await import("marked");
+	return _marked;
 }
 
 /**
- * Extract <body> content from agent-generated HTML. Agents write full HTML docs
- * but we only need the body. Also cleans mermaid blocks and converts to our
- * template's container classes.
+ * Strip style/classDef/init directives from mermaid source.
+ * The agent should only write graph structure, but if it slips in styling we remove it.
  */
-function extractBodyContent(html: string): { title: string; body: string } {
-	// Extract title
-	const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-	const title = titleMatch ? titleMatch[1].trim() : "Deep Dive";
+function cleanMermaidSource(code: string): string {
+	return code
+		.split("\n")
+		.filter(line => !line.trim().match(/^style\s+\S+\s+/))
+		.filter(line => !line.trim().match(/^%%\{init:/))
+		.filter(line => !line.trim().match(/^classDef\s+/))
+		.filter(line => !line.trim().match(/^class\s+\S+\s+\S+$/))
+		.join("\n")
+		.trim();
+}
 
-	// Extract body content
-	const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-	let body = bodyMatch ? bodyMatch[1].trim() : html;
+/**
+ * Render a markdown file to HTML using the template.
+ *
+ * Pipeline: .md → marked (with custom mermaid renderer) → template → .html
+ *
+ * - ```mermaid blocks become <div class="mermaid-box"> containers
+ * - Style directives are stripped from mermaid source
+ * - All other markdown renders to standard HTML
+ * - Result is wrapped in template.html (owns CDN deps, CSS, mermaid theme, JS)
+ */
+async function renderDocument(mdPath: string): Promise<string> {
+	const md = fs.readFileSync(mdPath, "utf-8");
+	const htmlPath = mdPath.replace(/\.md$/, ".html");
 
-	// If the agent wrote just content (no body tags), use as-is
-	if (!bodyMatch && !html.includes("<html")) {
-		body = html;
-	}
+	const { marked } = await getMarked();
 
-	// Remove any <script> tags the agent included (template handles all JS)
-	body = body.replace(/<script[\s\S]*?<\/script>/gi, "");
-
-	// Clean mermaid blocks: strip style directives, wrap in our container
-	body = body.replace(
-		/(<(?:div|pre)\s+class\s*=\s*"mermaid"[^>]*>)([\s\S]*?)(<\/(?:div|pre)>)/gi,
-		(match, openTag, content, closeTag) => {
-			const cleaned = cleanMermaidBlock(content);
-			return `${openTag}${cleaned}${closeTag}`;
-		}
-	);
-
-	// Wrap bare <div class="mermaid"> in our .mermaid-box container if not already wrapped
-	body = body.replace(
-		/(?<!<div class="mermaid-box">[\s\S]{0,200})(<div class="mermaid"[^>]*>[\s\S]*?<\/div>)/gi,
-		(match, diagram) => {
-			// Check if already inside a mermaid-box or mermaid-wrap
-			if (match.includes("mermaid-box") || match.includes("mermaid-wrap")) return match;
+	// Custom renderer: mermaid code blocks → .mermaid-box containers
+	const renderer = new marked.Renderer();
+	const origCode = renderer.code.bind(renderer);
+	renderer.code = function ({ text, lang }: { text: string; lang?: string }) {
+		if (lang === "mermaid") {
+			const clean = cleanMermaidSource(text);
 			return `<div class="mermaid-box">
   <div class="controls">
     <button class="zoom-in">+</button>
@@ -360,36 +349,28 @@ function extractBodyContent(html: string): { title: string; body: string } {
     <button class="zoom-reset">Reset</button>
   </div>
   <div class="pan-area">
-    ${diagram}
+    <div class="mermaid">
+${clean}
+    </div>
   </div>
 </div>`;
 		}
-	);
+		return origCode({ text, lang });
+	};
 
-	return { title, body };
-}
+	// Extract title from first h1
+	const titleMatch = md.match(/^#\s+(.+)$/m);
+	const title = titleMatch ? titleMatch[1].trim() : "Deep Dive";
 
-/**
- * Build final HTML document by wrapping agent content in our template.
- * The template owns all CDN deps, CSS, mermaid theme, JS initialization.
- */
-function buildDocument(htmlPath: string): { changed: boolean } {
-	if (!fs.existsSync(htmlPath)) return { changed: false };
-	const raw = fs.readFileSync(htmlPath, "utf-8");
-	const { title, body } = extractBodyContent(raw);
+	const body = await marked.parse(md, { renderer });
 	const template = getTemplate();
-	const doc = template
+	const html = template
 		.replace("{{TITLE}}", title.replace(/</g, "&lt;"))
 		.replace("{{CONTENT}}", body);
-	fs.writeFileSync(htmlPath, doc);
-	agentLog(`Document built: extracted body, wrapped in template, cleaned mermaid blocks`);
-	return { changed: true };
-}
 
-// Back-compat alias used in existing code
-function sanitizeDocument(htmlPath: string): { changed: boolean; fixes: string[] } {
-	const result = buildDocument(htmlPath);
-	return { changed: result.changed, fixes: result.changed ? ["Wrapped in template"] : [] };
+	fs.writeFileSync(htmlPath, html);
+	agentLog(`Rendered ${mdPath} → ${htmlPath} (${html.length} bytes)`);
+	return htmlPath;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -478,7 +459,7 @@ async function runValidationLoop() {
 
 	// Errors found — send fix request to agent
 	if (S.validationAttempt <= S.maxValidationAttempts && S.proc?.stdin?.writable) {
-		const fixPrompt = `The HTML document has ${result.errors.length} mermaid diagram error(s). Please fix them:
+		const fixPrompt = `The document has ${result.errors.length} mermaid diagram error(s). Please fix them:
 
 ${result.errors.join("\n\n---\n\n")}
 
@@ -489,7 +470,7 @@ Common fixes:
 - Don't use backticks inside mermaid blocks
 - Keep node IDs simple alphanumeric
 
-Read the current file, fix the broken diagrams, and write the corrected HTML back to: ${S.htmlPath}`;
+Read the current markdown file, fix the broken diagrams, and write the corrected file back to: ${S.htmlPath?.replace(/\.html$/, ".md") || "the markdown file"}`;
 
 		agentLog(`Sending fix prompt to agent (attempt ${S.validationAttempt}/${S.maxValidationAttempts})`);
 		wsBroadcast({ type: "validation_fix_request", attempt: S.validationAttempt, maxAttempts: S.maxValidationAttempts });
@@ -616,14 +597,14 @@ function handleRpcLine(line: string) {
 		const label = tn === "bash" ? `$ ${(args.command || "").slice(0, 150)}` : (args.path || "").slice(0, 150);
 		agentLog(`[tool:${event.toolName}] start ${label}`);
 		if (tcId) pendingToolTimers.set(tcId, Date.now());
-		if ((tn === "write" || tn === "edit") && args.path && String(args.path).endsWith(".html")) {
+		if ((tn === "write" || tn === "edit") && args.path && String(args.path).endsWith(".md")) {
 			if (tcId) pendingWritePaths.set(tcId, String(args.path));
 		}
-		// Detect bash writes to HTML files (e.g. cat heredoc)
+		// Detect bash writes to markdown files (e.g. cat heredoc)
 		if (tn === "bash" && args.command) {
 			const cmd = String(args.command);
-			const htmlMatch = cmd.match(/>\s*(['"]?)(\S+\.html)\1/);
-			if (htmlMatch && tcId) pendingWritePaths.set(tcId, htmlMatch[2].startsWith("/") ? htmlMatch[2] : path.join(S.targetPath || "", htmlMatch[2]));
+			const mdMatch = cmd.match(/>\s*(['"]?)(\S+\.md)\1/);
+			if (mdMatch && tcId) pendingWritePaths.set(tcId, mdMatch[2].startsWith("/") ? mdMatch[2] : path.join(S.targetPath || "", mdMatch[2]));
 		}
 	}
 
@@ -638,19 +619,18 @@ function handleRpcLine(line: string) {
 		agentLog(`[tool:${event.toolName}] ${event.isError ? "ERROR" : "ok"}${dur}`);
 		if ((tn === "write" || tn === "edit" || tn === "bash") && !event.isError && writePath) {
 			if (fs.existsSync(writePath)) {
-				S.htmlPath = writePath;
-				agentLog(`HTML document detected: ${writePath}`);
-
-				// Sanitize first: fix CDN URLs, ensure dependencies exist
-				const sanitizeResult = sanitizeDocument(writePath);
-				if (sanitizeResult.fixes.length > 0) {
-					wsBroadcast({ type: "doc_sanitized", fixes: sanitizeResult.fixes });
-				}
-
-				saveMeta();
-				wsBroadcast({ type: "doc_ready", path: S.htmlPath });
-				// Then validate mermaid diagrams
-				setTimeout(() => runValidationLoop(), 1000);
+				agentLog(`Markdown document detected: ${writePath}`);
+				// Render markdown → HTML (async)
+				renderDocument(writePath).then(htmlPath => {
+					S.htmlPath = htmlPath;
+					saveMeta();
+					wsBroadcast({ type: "doc_ready", path: S.htmlPath });
+					// Then validate mermaid diagrams
+					setTimeout(() => runValidationLoop(), 1000);
+				}).catch(err => {
+					agentLog(`Render error: ${err}`);
+					wsBroadcast({ type: "render_error", error: String(err) });
+				});
 			}
 		}
 	}
@@ -960,7 +940,7 @@ function stopAll() {
 // ═══════════════════════════════════════════════════════════════════════
 
 function buildExplorePrompt(targetPath: string, prompt: string, depth: string, sessionId: string, scope?: string): string {
-	const outputPath = path.join(targetPath, ".pi", "deep-dive", sessionId, "document.html");
+	const outputPath = path.join(targetPath, ".pi", "deep-dive", sessionId, "document.md");
 	const isFocused = !!prompt;
 	const hasScope = !!scope;
 
@@ -1014,51 +994,40 @@ Depth: ${depth} — ${depthGuide[depth] || depthGuide.medium}
 
 ${explorePhase}
 
-## Phase 2: Write HTML content
+## Phase 2: Write Markdown
 IMPORTANT: Use the \`write\` tool (not bash/cat/heredoc) to create the file.
-Write an HTML file to: ${outputPath}
+Write a MARKDOWN file to: ${outputPath}
 
-The system wraps your output in a template that provides all CDN dependencies (fonts,
-highlight.js, mermaid), CSS design system, and JavaScript initialization. You write
-the body content only. Do NOT include <html>, <head>, <link>, <script>, or <style>
-tags. Start directly with your content.
+Use standard markdown: headings, paragraphs, code blocks, lists, tables, bold, links.
+The system renders your markdown to a styled HTML page automatically. Do NOT write HTML.
 
-Available CSS classes from the template:
-  .hero           — centered header card (put h1 + subtitle p inside)
-  nav.sticky-nav  — sticky nav bar, put <a href="#id"> links inside
-  .metrics        — flex row of .metric-card items (each has .value + .label)
-  section         — card container for each content section
-  .callout        — info box (.callout.warning, .callout.danger, .callout.success)
-  .mermaid-box    — diagram container with zoom controls (see below)
-  pre > code      — code blocks (use class="language-xxx" for highlighting)
-  table, th, td   — styled tables
+Structure your document like this:
+- Start with a # title and a short subtitle paragraph
+- Use ## for major sections, ### for subsections
+- Use tables for structured data (| col1 | col2 |)
+- Use fenced code blocks with language tags (\`\`\`go, \`\`\`typescript, etc.)
+- Use > blockquotes for callouts and important notes
 
-Mermaid diagrams: write ONLY the graph structure (nodes, edges, subgraphs, labels).
-Do NOT include any styling: no \`style\` directives, no \`classDef\`, no \`%%{init:}%%\`,
-no color values. The template handles all colors, fonts, and theming centrally.
-Wrap each diagram like this:
-  <div class="mermaid-box">
-    <div class="controls">
-      <button class="zoom-in">+</button>
-      <button class="zoom-out">&minus;</button>
-      <button class="zoom-reset">Reset</button>
-    </div>
-    <div class="pan-area">
-      <div class="mermaid">
-      graph TD
-        A[Something] --> B[Other]
-      </div>
-    </div>
-  </div>
+For architecture diagrams, use mermaid code blocks:
 
-Diagram rules:
-- 5-15 nodes each. Use <br/> for multi-line labels.
-- Do NOT use square brackets [] in sequence diagram messages (triggers mermaid "loop" keyword). Use () instead.
-- Escape &amp; &lt; &gt; in HTML context.
+\`\`\`mermaid
+graph TD
+    A[Client Request] --> B[API Gateway]
+    B --> C[Auth Service]
+    B --> D[Data Service]
+    D --> E[(Database)]
+\`\`\`
+
+Mermaid rules:
+- Write ONLY graph structure: nodes, edges, subgraphs, labels.
+- Do NOT add \`style\`, \`classDef\`, \`%%{init:}%%\`, or any color/theme directives.
+  The rendering system handles all colors and theming. Any styling you add will be stripped.
+- 5-15 nodes per diagram. Use <br/> for multi-line node labels.
+- Do NOT use square brackets [] in sequence diagram message text (triggers mermaid "loop" keyword). Use () instead.
 - Keep node IDs simple alphanumeric.
 ${contentGuide}
 
-After writing, the system will automatically validate your mermaid diagrams. If there are errors, you'll be asked to fix them.`;
+After writing, the system will render your markdown and validate mermaid diagrams. If there are errors, you'll be asked to fix them.`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

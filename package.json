@@ -3,10 +3,17 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Pi extensions and skills that are boring but good",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "Apache-2.0",
   "pi": {
-    "extensions": ["pi-extensions"]
+    "extensions": [
+      "pi-extensions"
+    ]
+  },
+  "dependencies": {
+    "marked": "^15.0.0"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
