@@ -107,7 +107,7 @@ if (changelog.includes("## [Unreleased]")) {
 // 4. Commit and push
 console.log("Committing...");
 run("git add package.json package-lock.json CHANGELOG.md");
-run(`git commit -m "Release v${version}"`);
+run(`git commit -S -m "Release v${version}"`);
 console.log();
 
 console.log("Pushing to origin...");
@@ -136,7 +136,7 @@ console.log();
 // 7. Commit and push
 console.log("Committing changelog update...");
 run("git add CHANGELOG.md");
-run('git commit -m "Add [Unreleased] section for next cycle"');
+run('git commit -S -m "Add [Unreleased] section for next cycle"');
 run("git push origin main");
 console.log();
 

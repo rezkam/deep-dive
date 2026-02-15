@@ -5,6 +5,22 @@ All notable changes to CodeDive will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Chat history recovery** — server sends last 20 messages on WebSocket connect; full history loads on scroll-to-top
+- **Read-only mode by default** — agent cannot modify, create, or delete files unless `--dangerously-allow-edits` is passed
+- **Safe bash** — 26 categories of destructive commands blocked (rm, mv, sed -i, git commit, npm install, redirects, etc.)
+- **Read-only badge** — `(read-only)` indicator in browser status bar with tooltip
+- **Browser tests** — 49 Playwright tests across 3 test files (chat history, read-only mode, full E2E journey)
+- **Real CLI E2E tests** — 25 tests that spawn the actual CLI binary, clone real repos, connect real browser (requires API key)
+- **CI matrix** — tests run on Node 22, 23, 24, 25 across Ubuntu and macOS
+
+### Changed
+
+- **Renamed project** — `deep-dive` → `codedive` / CodeDive across all source, CLI commands, env vars, config directories
+
 ## [0.1.0] - 2026-02-14
 
 ### 🎉 Initial Release
