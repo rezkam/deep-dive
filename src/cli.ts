@@ -162,16 +162,16 @@ auth
 						logger.hint(info.instructions);
 						logger.newline();
 					}
-					logger.info("Press Enter to open the login page in your browser...");
+					logger.info("Login URL:");
+					logger.command(info.url);
 					logger.newline();
 
 					const rl = readline.createInterface({
 						input: process.stdin,
 						output: process.stdout,
 					});
-					rl.question("", () => {
+					rl.question("Press Enter to open in browser (or copy the URL above)... ", () => {
 						rl.close();
-						// Open URL safely using platform-native commands
 						const url = info.url;
 						const platform = process.platform;
 						if (platform === "darwin") {
@@ -181,10 +181,6 @@ auth
 						} else {
 							exec(`xdg-open ${JSON.stringify(url)}`);
 						}
-						logger.newline();
-						logger.info("If the browser didn't open, copy this URL manually:");
-						logger.command(url);
-						logger.newline();
 					});
 				},
 				onPrompt: (prompt: { message: string; isPassword?: boolean }) => {
