@@ -12,21 +12,18 @@ export interface AuthCheckResult {
 	source?: "storage" | "env";
 }
 
+const STORAGE_AUTH_PROVIDERS = [
+	...Object.keys(ENV_VAR_MAP),
+	"google-gemini-cli",
+	"google-antigravity",
+	"openai-codex",
+	// Legacy aliases (for backwards compatibility with any manually written auth.json)
+	"antigravity",
+];
+
 export function checkAuth(storage: AuthStorage): AuthCheckResult {
 	// Check if any provider has credentials in auth storage
-	const providers = [
-		"anthropic",
-		"openai",
-		"google",
-		"groq",
-		"xai",
-		"openrouter",
-		"mistral",
-		"cerebras",
-		"github-copilot",
-	];
-
-	for (const provider of providers) {
+	for (const provider of STORAGE_AUTH_PROVIDERS) {
 		const cred = storage.get(provider);
 		if (cred) {
 			return { hasAuth: true, provider, source: "storage" };

@@ -8,34 +8,72 @@ import { ValidationError, AuthenticationError } from "./errors.js";
 import { ENV_VAR_MAP, AUTH_PATH, APP_CMD } from "../constants.js";
 
 interface OAuthProvider {
+	id: string;
+	canonicalId: string;
 	name: string;
 	subscription: string;
 }
 
-const OAUTH_PROVIDERS: Record<string, OAuthProvider> = {
-	anthropic: {
+const OAUTH_PROVIDERS: OAuthProvider[] = [
+	{
+		id: "anthropic",
+		canonicalId: "anthropic",
 		name: "Anthropic Claude",
 		subscription: "Claude Pro/Max or Claude Team",
 	},
-	"github-copilot": {
+	{
+		id: "github-copilot",
+		canonicalId: "github-copilot",
 		name: "GitHub Copilot",
 		subscription: "GitHub Copilot Individual, Business, or Enterprise",
 	},
-	google: {
+	{
+		id: "google",
+		canonicalId: "google-gemini-cli",
 		name: "Google Gemini CLI",
 		subscription: "Google Gemini CLI access (via gcloud)",
 	},
-	antigravity: {
+	{
+		id: "antigravity",
+		canonicalId: "google-antigravity",
 		name: "Google Cloud Antigravity",
 		subscription: "Google Cloud Project with Antigravity API enabled",
 	},
-	"openai-codex": {
+	{
+		id: "openai-codex",
+		canonicalId: "openai-codex",
 		name: "OpenAI Codex",
 		subscription: "ChatGPT Plus/Pro or ChatGPT Team (OAuth flow)",
 	},
-};
+];
+
+const OAUTH_CANONICAL_BY_INPUT: Record<string, string> = {};
+const OAUTH_PRIMARY_BY_CANONICAL: Record<string, string> = {};
+const OAUTH_IDS_BY_CANONICAL: Record<string, string[]> = {};
+
+for (const provider of OAUTH_PROVIDERS) {
+	OAUTH_CANONICAL_BY_INPUT[provider.id] = provider.canonicalId;
+	OAUTH_CANONICAL_BY_INPUT[provider.canonicalId] = provider.canonicalId;
+
+	if (!OAUTH_PRIMARY_BY_CANONICAL[provider.canonicalId]) {
+		OAUTH_PRIMARY_BY_CANONICAL[provider.canonicalId] = provider.id;
+	}
+
+	const ids = new Set(OAUTH_IDS_BY_CANONICAL[provider.canonicalId] ?? []);
+	ids.add(provider.id);
+	ids.add(provider.canonicalId);
+	OAUTH_IDS_BY_CANONICAL[provider.canonicalId] = [...ids];
+}
 
 const API_KEY_PROVIDERS = Object.keys(ENV_VAR_MAP);
+
+function resolveOAuthProviderId(input: string): string | undefined {
+	return OAUTH_CANONICAL_BY_INPUT[input];
+}
+
+function getPrimaryOAuthProviderId(canonicalId: string): string {
+	return OAUTH_PRIMARY_BY_CANONICAL[canonicalId] ?? canonicalId;
+}
 
 export class AuthService {
 	constructor(
@@ -69,7 +107,8 @@ export class AuthService {
 			onPrompt: (prompt: { message: string; isPassword?: boolean }) => Promise<string>;
 		},
 	): Promise<void> {
-		if (!OAUTH_PROVIDERS[provider]) {
+		const canonicalProvider = resolveOAuthProviderId(provider);
+		if (!canonicalProvider) {
 			this.logger.error(`Provider '${provider}' does not support OAuth login`);
 			this.logger.newline();
 			this.logger.section("Supported OAuth providers:");
@@ -81,8 +120,8 @@ export class AuthService {
 		}
 
 		try {
-			await this.storage.login(provider, callbacks);
-			this.logger.success(`Successfully authenticated with ${provider}`);
+			await this.storage.login(canonicalProvider, callbacks);
+			this.logger.success(`Successfully authenticated with ${getPrimaryOAuthProviderId(canonicalProvider)}`);
 			this.logger.newline();
 		} catch (error) {
 			this.logger.error(`Login failed: ${error}`);
@@ -92,13 +131,24 @@ export class AuthService {
 	}
 
 	async removeCredentials(provider: string): Promise<void> {
-		this.storage.remove(provider);
-		this.logger.success(`Credentials removed for ${provider}`);
+		const canonicalProvider = resolveOAuthProviderId(provider);
+
+		if (canonicalProvider) {
+			const ids = OAUTH_IDS_BY_CANONICAL[canonicalProvider] ?? [provider];
+			for (const id of ids) {
+				this.storage.remove(id);
+			}
+			this.logger.success(`Credentials removed for ${getPrimaryOAuthProviderId(canonicalProvider)}`);
+		} else {
+			this.storage.remove(provider);
+			this.logger.success(`Credentials removed for ${provider}`);
+		}
+
 		this.logger.newline();
 	}
 
 	listCredentials(): void {
-		const stored = API_KEY_PROVIDERS.filter((p) => this.storage.get(p) !== null);
+		const stored = this.storage.list().sort();
 
 		if (stored.length === 0) {
 			this.logger.info("No credentials stored.");
@@ -109,10 +159,21 @@ export class AuthService {
 
 		this.logger.section("Stored credentials:");
 		this.logger.newline();
+
+		const seen = new Set<string>();
 		for (const provider of stored) {
 			const cred = this.storage.get(provider);
-			const type = cred?.type === "oauth" ? "OAuth Token" : "API Key";
-			this.logger.info(`  ✓ ${provider} (${type})`);
+			if (!cred) continue;
+
+			const canonicalProvider = resolveOAuthProviderId(provider);
+			const displayProvider = canonicalProvider
+				? getPrimaryOAuthProviderId(canonicalProvider)
+				: provider;
+			if (seen.has(displayProvider)) continue;
+			seen.add(displayProvider);
+
+			const type = cred.type === "oauth" ? "OAuth Token" : "API Key";
+			this.logger.info(`  ✓ ${displayProvider} (${type})`);
 		}
 		this.logger.newline();
 	}
@@ -136,8 +197,8 @@ export class AuthService {
 	}
 
 	private showOAuthProviders(): void {
-		for (const [id, info] of Object.entries(OAUTH_PROVIDERS)) {
-			this.logger.info(`  ${id.padEnd(18)} → ${info.name}`);
+		for (const info of OAUTH_PROVIDERS) {
+			this.logger.info(`  ${info.id.padEnd(18)} → ${info.name}`);
 			this.logger.info(`  ${" ".repeat(18)}   ${info.subscription}`);
 			this.logger.newline();
 		}

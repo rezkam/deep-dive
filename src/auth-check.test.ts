@@ -72,6 +72,24 @@ describe("checkAuth", () => {
 			expect(result.source).toBe("storage");
 		});
 
+		it("returns hasAuth=true for google antigravity OAuth in storage", () => {
+			const result = checkAuth(makeStorage({
+				"google-antigravity": { type: "oauth", accessToken: "token" },
+			}));
+			expect(result.hasAuth).toBe(true);
+			expect(result.provider).toBe("google-antigravity");
+			expect(result.source).toBe("storage");
+		});
+
+		it("returns hasAuth=true for openai-codex OAuth in storage", () => {
+			const result = checkAuth(makeStorage({
+				"openai-codex": { type: "oauth", accessToken: "token" },
+			}));
+			expect(result.hasAuth).toBe(true);
+			expect(result.provider).toBe("openai-codex");
+			expect(result.source).toBe("storage");
+		});
+
 		it("returns the first provider found in storage", () => {
 			// Anthropic is checked before openai in the provider list
 			const storage = makeStorage({
