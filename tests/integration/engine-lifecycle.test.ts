@@ -24,8 +24,14 @@ import {
 	start, stop, stopAll, reset, getState, handleEvent, handleCrash, chat, abort,
 	type SessionFactory,
 } from "../../src/engine.js";
-import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
-import { evAgentStart, evAgentEnd, evMessageStart } from "../helpers/events.js";
+import type { AgentSession, AgentSessionEvent } from "@mariozechner/pi-coding-agent";
+import {
+	evAgentStart, evAgentEnd, evMessageStart,
+	evTextDelta, evToolStart, evToolEnd, evMessageEnd,
+} from "../helpers/events.js";
+import {
+	createMockSession, mockSessionFactory, failingSessionFactory,
+} from "../helpers/mock-session.js";
 
 /** How many restarts are allowed */
 const MAX_CRASH_RESTARTS = 3;
@@ -50,67 +56,7 @@ function makeTempDir(): string {
 	return dir;
 }
 
-/** Minimal mock agent session — records calls, lets tests fire events. */
-function createMockSession() {
-	const subscribers: Array<(event: AgentSessionEvent) => void> = [];
-	let aborted = false;
-
-	const session = {
-		subscribe: (fn: (event: AgentSessionEvent) => void) => {
-			subscribers.push(fn);
-			return () => {
-				const idx = subscribers.indexOf(fn);
-				if (idx >= 0) subscribers.splice(idx, 1);
-			};
-		},
-		prompt: async (_text: string, _opts?: any) => {
-			// Don't do anything — tests will fire events manually
-		},
-		abort: async () => { aborted = true; },
-		_messages: [] as any[],
-		get messages() { return this._messages; },
-		get state() { return { messages: this._messages }; },
-		setModel: async () => {},
-		// Simulate firing an event (for tests)
-		_emit: (event: AgentSessionEvent) => {
-			for (const fn of subscribers) fn(event);
-		},
-		_wasAborted: () => aborted,
-	};
-
-	return session;
-}
-
-/** Session factory for tests — returns a mock session. */
-function mockSessionFactory(): { factory: SessionFactory; session: ReturnType<typeof createMockSession> } {
-	const session = createMockSession();
-	const factory: SessionFactory = async () => session as any;
-	return { factory, session };
-}
-
-/**
- * Session factory that can be configured to fail N times then succeed.
- * Useful for testing crash recovery.
- */
-function configurableSessionFactory(opts: {
-	failCount?: number; // How many times to throw before succeeding
-	failError?: string;
-} = {}) {
-	let callCount = 0;
-	const sessions: ReturnType<typeof createMockSession>[] = [];
-
-	const factory: SessionFactory = async () => {
-		callCount++;
-		if (opts.failCount && callCount <= opts.failCount) {
-			throw new Error(opts.failError ?? `Session creation failed (attempt ${callCount})`);
-		}
-		const session = createMockSession();
-		sessions.push(session);
-		return session as any;
-	};
-
-	return { factory, get callCount() { return callCount; }, sessions };
-}
+// createMockSession, mockSessionFactory, failingSessionFactory imported from ../helpers/mock-session.js
 
 /** HTTP GET with timeout */
 function httpGet(url: string): Promise<{ status: number; body: string }> {
@@ -132,6 +78,7 @@ function connectWs(port: number, token: string): Promise<{
 	close: () => void;
 	socket: net.Socket;
 	waitForMessage: (predicate: (msg: any) => boolean, timeoutMs?: number) => Promise<any>;
+	[Symbol.asyncDispose](): void;
 }> {
 	return new Promise((resolve, reject) => {
 		const key = crypto.randomBytes(16).toString("base64");
@@ -233,7 +180,7 @@ function connectWs(port: number, token: string): Promise<{
 						handshakeDone = true;
 						buffer = buffer.subarray(headerEndIdx + 4);
 						// Resolve first, then process any frames that arrived with the handshake
-						resolve({ messages, send, close: () => socket.end(), socket, waitForMessage });
+						resolve({ messages, send, close: () => socket.end(), socket, waitForMessage, [Symbol.asyncDispose]() { socket.end(); } });
 						processFrames();
 					} else {
 						reject(new Error("WS handshake failed"));
@@ -428,10 +375,8 @@ describe("Engine lifecycle (real server)", () => {
 			// Client connects late
 			const ws = await connectWs(port, token);
 			try {
-				// Wait for init + replayed events
-				await ws.waitForMessage((m) => m.type === "init");
-				// Give time for history replay
-				await new Promise((r) => setTimeout(r, 200));
+				// Wait for init + replayed agent_start event
+				await ws.waitForMessage((m) => m.type === "rpc_event" && m.event?.type === "agent_start");
 
 				const agentStartMsgs = ws.messages.filter(
 					(m) => m.type === "rpc_event" && m.event?.type === "agent_start"
@@ -448,7 +393,9 @@ describe("Engine lifecycle (real server)", () => {
 			const ws2 = await connectWs(port, token);
 			try {
 				handleEvent(evAgentStart());
-				await new Promise((r) => setTimeout(r, 100));
+				// Wait for both clients to receive the event
+				await ws1.waitForMessage((m) => m.type === "rpc_event" && m.event?.type === "agent_start");
+				await ws2.waitForMessage((m) => m.type === "rpc_event" && m.event?.type === "agent_start");
 
 				const has1 = ws1.messages.some((m) => m.type === "rpc_event" && m.event?.type === "agent_start");
 				const has2 = ws2.messages.some((m) => m.type === "rpc_event" && m.event?.type === "agent_start");
@@ -506,10 +453,8 @@ describe("Engine lifecycle (real server)", () => {
 			try {
 				ws.send({ type: "prompt", text: "explain auth" });
 
-				// Give the engine a moment to dispatch the prompt to the session.
-				// The mock session's prompt() is a no-op, so no agent_start fires,
-				// but the engine must remain running and not crash.
-				await new Promise((r) => setTimeout(r, 100));
+				// Wait for the prompt to reach the session (mock prompt() stores it in _promptCalls)
+				await waitForCondition(() => session._promptCalls.length > 0, 2000);
 
 				expect(getState().running).toBe(true);
 			} finally {
@@ -526,7 +471,8 @@ describe("Engine lifecycle (real server)", () => {
 			const ws = await connectWs(port, token);
 			try {
 				ws.send({ type: "abort" });
-				await new Promise((r) => setTimeout(r, 100));
+				// Wait for abort to reach the session
+				await waitForCondition(() => session._wasAborted(), 2000);
 			} finally {
 				ws.close();
 			}
@@ -639,44 +585,15 @@ describe("Engine lifecycle (real server)", () => {
 			expect(startMsg).toBeDefined();
 
 			// 2. Agent streams text
-			handleEvent({
-				type: "message_start",
-				message: { role: "assistant" },
-			} as any);
-
-			handleEvent({
-				type: "message_update",
-				assistantMessageEvent: {
-					type: "text_delta",
-					delta: "# Architecture\n",
-				},
-			} as any);
+			handleEvent(evMessageStart());
+			handleEvent(evTextDelta("# Architecture\n"));
 
 			// 3. Agent writes a file
-			handleEvent({
-				type: "tool_execution_start",
-				toolCallId: "tc1",
-				toolName: "Write",
-				args: { path: "/tmp/test.md" },
-			} as any);
-
-			handleEvent({
-				type: "tool_execution_end",
-				toolCallId: "tc1",
-				toolName: "Write",
-				result: "ok",
-				isError: false,
-			} as any);
+			handleEvent(evToolStart("Write", "tc1", { path: "/tmp/test.md" }));
+			handleEvent(evToolEnd("Write", "tc1", "ok"));
 
 			// 4. Agent finishes turn
-			handleEvent({
-				type: "message_end",
-				message: {
-					role: "assistant",
-					content: [{ type: "text", text: "Done exploring" }],
-					usage: { input_tokens: 100, output_tokens: 50 },
-				},
-			} as any);
+			handleEvent(evMessageEnd("Done exploring"));
 
 			handleEvent(evAgentEnd());
 
@@ -692,7 +609,8 @@ describe("Engine lifecycle (real server)", () => {
 
 			// 5. User sends a chat message
 			ws.send({ type: "prompt", text: "explain the auth system" });
-			await new Promise((r) => setTimeout(r, 100));
+			// Wait for prompt to reach session
+			await waitForCondition(() => session._promptCalls.some((c) => c.includes("explain the auth system")), 2000);
 
 			// 6. User stops
 			ws.send({ type: "stop" });
@@ -715,7 +633,8 @@ describe("Engine lifecycle (real server)", () => {
 			// Events happen
 			handleEvent(evAgentStart());
 			handleEvent(evAgentEnd());
-			await new Promise((r) => setTimeout(r, 50));
+			// Wait for ws1 to receive agent_end before disconnecting
+			await ws1.waitForMessage((m) => m.type === "rpc_event" && m.event?.type === "agent_end");
 
 			// Client 1 disconnects
 			ws1.socket.write(Buffer.from([0x88, 0x00]));
@@ -730,7 +649,9 @@ describe("Engine lifecycle (real server)", () => {
 			// Client 2 connects
 			const ws2 = await connectWs(port, token);
 			try {
-				await new Promise((r) => setTimeout(r, 100));
+				// Wait for all 4 replay events (2× start + 2× end)
+				await ws2.waitForMessage((m) => m.type === "rpc_event" && m.event?.type === "agent_end" &&
+					ws2.messages.filter((x) => x.type === "rpc_event").length >= 4);
 
 				// Should have init + all 4 events replayed
 				const agentEvents = ws2.messages.filter(
@@ -761,7 +682,8 @@ describe("Engine lifecycle (real server)", () => {
 				ws2.send({ type: "prompt", text: "question 2" });
 				ws3.send({ type: "prompt", text: "question 3" });
 
-				await new Promise((r) => setTimeout(r, 200));
+				// Wait for all 3 prompts to be dispatched
+				await waitForCondition(() => session._promptCalls.length >= 3, 2000);
 
 				// Engine should not crash
 				expect(getState().running).toBe(true);
@@ -784,7 +706,8 @@ describe("Engine lifecycle (real server)", () => {
 				ws1.send({ type: "prompt", text: "question" });
 				ws2.send({ type: "stop" });
 
-				await new Promise((r) => setTimeout(r, 200));
+				// Wait for stop to take effect
+				await waitForCondition(() => !getState().agentReady, 2000);
 
 				// Agent should be stopped
 				expect(getState().agentReady).toBe(false);
@@ -804,7 +727,8 @@ describe("Engine lifecycle (real server)", () => {
 			const ws = await connectWs(port, token);
 			try {
 				handleEvent(evAgentEnd());
-				await new Promise((r) => setTimeout(r, 100));
+				// Wait for at least init + agent_end to arrive
+				await ws.waitForMessage((m) => m.type === "rpc_event" && m.event?.type === "agent_end");
 
 				// Client should have all events (init + history + live)
 				expect(ws.messages.length).toBeGreaterThan(0);
@@ -841,7 +765,7 @@ describe("Engine lifecycle (real server)", () => {
 		});
 
 		it("crash recovery creates new session after backoff", async () => {
-			const { factory, sessions } = configurableSessionFactory();
+			const { factory, sessions } = failingSessionFactory();
 			const result = await start({
 				cwd: tempDir,
 				sessionFactory: factory,
@@ -933,16 +857,16 @@ describe("Engine lifecycle (real server)", () => {
 
 		it("crash while session factory fails on restart", async () => {
 			// First call succeeds, next calls fail
-			const { factory, sessions } = configurableSessionFactory({
+			const { factory, sessions } = failingSessionFactory({
 				failCount: 0, // 0 means no pre-failures; we control via the factory
 			});
 
 			// Use a factory that succeeds first time, then throws on restart
 			let callCount = 0;
-			const failingFactory: SessionFactory = async (targetPath) => {
+			const failingFactory: SessionFactory = async (_targetPath) => {
 				callCount++;
 				if (callCount === 1) {
-					return createMockSession() as any;
+					return createMockSession() as unknown as AgentSession;
 				}
 				throw new Error("Restart failed: no API key");
 			};
@@ -1011,7 +935,8 @@ describe("Engine lifecycle (real server)", () => {
 			// Connect client and wait for initial messages (init + history)
 			const ws = await connectWs(port, token);
 			try {
-				await new Promise((r) => setTimeout(r, 100));
+				// Wait for init + agent_start history
+				await ws.waitForMessage((m) => m.type === "rpc_event" && m.event?.type === "agent_start");
 
 				stop();
 
@@ -1020,12 +945,10 @@ describe("Engine lifecycle (real server)", () => {
 				// These events should be silently dropped (intentionalStop guard)
 				handleEvent(evAgentStart());
 				handleEvent(evAgentEnd());
-				handleEvent({
-					type: "message_update",
-					assistantMessageEvent: { type: "text_delta", delta: "leaked text" },
-				} as any);
+				handleEvent(evTextDelta("leaked text"));
 
-				await new Promise((r) => setTimeout(r, 100));
+				// Wait for agent_stopped to arrive, then check nothing else leaked
+				await ws.waitForMessage((m) => m.type === "agent_stopped");
 
 				// Only agent_stopped should appear after the stop
 				const afterStopMsgs = ws.messages.slice(afterStopIdx);
@@ -1091,47 +1014,18 @@ describe("Engine lifecycle (real server)", () => {
 			handleEvent(evAgentStart());
 
 			// Message start
-			handleEvent({
-				type: "message_start",
-				message: { role: "assistant" },
-			} as any);
+			handleEvent(evMessageStart());
 
 			// Text streaming
-			handleEvent({
-				type: "message_update",
-				assistantMessageEvent: { type: "text_delta", delta: "# Header\n" },
-			} as any);
-
-			handleEvent({
-				type: "message_update",
-				assistantMessageEvent: { type: "text_delta", delta: "Some content" },
-			} as any);
+			handleEvent(evTextDelta("# Header\n"));
+			handleEvent(evTextDelta("Some content"));
 
 			// Tool use
-			handleEvent({
-				type: "tool_execution_start",
-				toolCallId: "t1",
-				toolName: "Read",
-				args: { path: "/tmp/test.ts" },
-			} as any);
-
-			handleEvent({
-				type: "tool_execution_end",
-				toolCallId: "t1",
-				toolName: "Read",
-				result: "file contents",
-				isError: false,
-			} as any);
+			handleEvent(evToolStart("Read", "t1", { path: "/tmp/test.ts" }));
+			handleEvent(evToolEnd("Read", "t1", "file contents"));
 
 			// Message end
-			handleEvent({
-				type: "message_end",
-				message: {
-					role: "assistant",
-					content: [{ type: "text", text: "Done" }],
-					usage: { input_tokens: 50, output_tokens: 25 },
-				},
-			} as any);
+			handleEvent(evMessageEnd("Done"));
 
 			handleEvent(evAgentEnd());
 
@@ -1165,20 +1059,8 @@ describe("Engine lifecycle (real server)", () => {
 			fs.writeFileSync(mdPath, "# Test\n\nSome content");
 
 			// Simulate Write tool for a markdown file
-			handleEvent({
-				type: "tool_execution_start",
-				toolCallId: "t1",
-				toolName: "Write",
-				args: { path: mdPath },
-			} as any);
-
-			handleEvent({
-				type: "tool_execution_end",
-				toolCallId: "t1",
-				toolName: "Write",
-				result: "ok",
-				isError: false,
-			} as any);
+			handleEvent(evToolStart("Write", "t1", { path: mdPath }));
+			handleEvent(evToolEnd("Write", "t1", "ok"));
 
 			// Wait for async render to complete
 			await waitForCondition(() => getState().htmlPath !== null, 3000);
@@ -1265,7 +1147,7 @@ describe("Engine lifecycle (real server)", () => {
 			const ws = await connectWs(port, token);
 			try {
 				// Wait for init + agent_start history to arrive
-				await new Promise((r) => setTimeout(r, 100));
+				await ws.waitForMessage((m) => m.type === "rpc_event" && m.event?.type === "agent_start");
 				const preStopCount = ws.messages.length;
 
 				// Stop, then try to inject events
@@ -1273,7 +1155,8 @@ describe("Engine lifecycle (real server)", () => {
 				handleEvent(evAgentStart());
 				handleEvent(evMessageStart());
 
-				await new Promise((r) => setTimeout(r, 100));
+				// Wait for agent_stopped before asserting no leakage
+				await ws.waitForMessage((m) => m.type === "agent_stopped");
 
 				// Check that the only new message is agent_stopped (from stop())
 				const postStopMessages = ws.messages.slice(preStopCount);
@@ -1314,7 +1197,7 @@ describe("Engine lifecycle (real server)", () => {
 
 		it("full scenario: start → explore → crash → restart → resume → stop", async () => {
 			// Use a factory that tracks sessions
-			const { factory, sessions } = configurableSessionFactory();
+			const { factory, sessions } = failingSessionFactory();
 			const result = await start({
 				cwd: tempDir,
 				sessionFactory: factory,
@@ -1331,10 +1214,7 @@ describe("Engine lifecycle (real server)", () => {
 				handleEvent(evAgentStart());
 
 				// 2. Agent streams a document
-				handleEvent({
-					type: "message_update",
-					assistantMessageEvent: { type: "text_delta", delta: "# Analysis" },
-				} as any);
+				handleEvent(evTextDelta("# Analysis"));
 
 				handleEvent(evAgentEnd());
 
@@ -1353,7 +1233,8 @@ describe("Engine lifecycle (real server)", () => {
 
 				// 6. User sends a follow-up
 				ws.send({ type: "prompt", text: "explain more" });
-				await new Promise((r) => setTimeout(r, 100));
+				// Wait for prompt to reach the (restarted) session
+				await waitForCondition(() => sessions.some((s) => s._promptCalls.includes("explain more")), 2000);
 
 				// 7. User stops
 				ws.send({ type: "stop" });
@@ -1443,8 +1324,8 @@ describe("Engine lifecycle (real server)", () => {
 			try {
 				// Wait for init message
 				await ws.waitForMessage((m) => m.type === "init", 2000);
-				// Give it a moment — chat_history should NOT arrive
-				await new Promise((r) => setTimeout(r, 200));
+				// Deliberate short wait: asserting absence of chat_history (no condition to poll)
+				await new Promise((r) => setTimeout(r, 50));
 
 				const chatHistoryMsgs = ws.messages.filter((m) => m.type === "chat_history");
 				expect(chatHistoryMsgs).toHaveLength(0);
@@ -1471,7 +1352,8 @@ describe("Engine lifecycle (real server)", () => {
 
 			// First client disconnects
 			ws1.close();
-			await new Promise((r) => setTimeout(r, 100));
+			// Wait for server to register the disconnect
+			await waitForCondition(() => getState().clientCount === 0, 2000);
 
 			// Second client connects — should get chat history
 			const ws2 = await connectWs(port, token);

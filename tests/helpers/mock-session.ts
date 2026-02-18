@@ -1,78 +1,93 @@
 /**
  * Typed mock session factory for integration and unit tests.
  *
- * Provides a minimal AgentSession-compatible mock that:
- * - Can emit events via `_emit()` (for triggering handleEvent paths)
- * - Tracks abort calls via `_wasAborted()`
- * - Replaces `as any` casts with `as unknown as AgentSession`
+ * Provides a MockSession object that satisfies AgentSession structurally
+ * without requiring an actual class instance (avoids `as any` casts).
  *
  * Usage:
  *   import { createMockSession, mockSessionFactory } from "../helpers/mock-session.js";
  *
  *   const { factory, session } = mockSessionFactory();
- *   handleEvent(evAgentStart()); // session emits events
+ *   handleEvent(evAgentStart());         // triggers subscribed listeners
+ *   session._emit(evAgentEnd());          // directly fire an event
  *   expect(session._wasAborted()).toBe(false);
+ *   expect(session._promptCalls).toHaveLength(1);
  */
 
 import type { AgentSession, AgentSessionEvent } from "@mariozechner/pi-coding-agent";
 import type { SessionFactory } from "../../src/engine.js";
 
-// ── Internal mock shape ───────────────────────────────────────────────────
+// ── Public test interface ──────────────────────────────────────────────────
 
-type Subscriber = (event: AgentSessionEvent) => void;
+/**
+ * A test-friendly mock session with extra inspection hooks.
+ * Defined as a standalone interface (not an intersection with AgentSession)
+ * to avoid `never` type when AgentSession private members are involved.
+ */
+export interface MockSession {
+	// AgentSession public interface (subset used by the engine)
+	subscribe(listener: (event: AgentSessionEvent) => void): () => void;
+	prompt(text: string, opts?: unknown): Promise<void>;
+	abort(): Promise<void>;
+	setModel(model: unknown): Promise<void>;
+	getActiveToolNames(): string[];
+	getSessionStats(): {
+		sessionFile: string | undefined;
+		sessionId: string;
+		userMessages: number;
+		assistantMessages: number;
+		toolCalls: number;
+		inputTokens: number;
+		outputTokens: number;
+		totalCost: number;
+	};
+	aborted: boolean;
+	messages: unknown[];
+	state: { messages: unknown[] };
 
-/** The minimal set of extra test-control properties exposed on mock sessions. */
-export interface MockSessionExtras {
+	// Test-control extras
 	/** Fire an event to all subscribers — simulates real session events. */
-	_emit: (event: AgentSessionEvent) => void;
+	_emit(event: AgentSessionEvent): void;
 	/** Returns true if abort() was called at least once. */
-	_wasAborted: () => boolean;
-	/** Direct access to the messages array for assertions. */
+	_wasAborted(): boolean;
+	/** All text strings passed to prompt() — for assertion. */
+	_promptCalls: string[];
+	/** Direct access to messages array — for pushing fake chat history. */
 	_messages: unknown[];
 }
-
-export type MockSession = AgentSession & MockSessionExtras;
 
 // ── Factory ───────────────────────────────────────────────────────────────
 
 /**
  * Creates a minimal mock AgentSession for tests.
  *
- * The mock satisfies the AgentSession interface without real I/O:
- * - `subscribe()` collects listeners; `_emit()` fires them
- * - `prompt()` is a no-op (tests fire events manually via `_emit`)
- * - `abort()` records the call; `_wasAborted()` returns the result
- * - `setModel()` is a no-op
+ * The mock is structurally compatible with AgentSession:
+ * - subscribe() collects listeners; _emit() fires them
+ * - prompt() records calls in _promptCalls; does not run any AI
+ * - abort() sets aborted flag; _wasAborted() returns it
+ * - setModel() is a no-op
  */
 export function createMockSession(): MockSession {
-	const subscribers: Subscriber[] = [];
+	const subscribers: Array<(event: AgentSessionEvent) => void> = [];
 	let aborted = false;
+	const promptCalls: string[] = [];
+	const messages: unknown[] = [];
 
-	const session = {
-		// ── AgentSession required interface ──────────────────────────────
-		subscribe(fn: Subscriber): () => void {
+	const session: MockSession = {
+		// ── AgentSession interface ─────────────────────────────────────────
+		subscribe(fn) {
 			subscribers.push(fn);
 			return () => {
 				const idx = subscribers.indexOf(fn);
 				if (idx >= 0) subscribers.splice(idx, 1);
 			};
 		},
-		prompt: async (_text: string, _opts?: unknown): Promise<void> => {
-			// no-op: tests fire events manually via _emit
+		prompt: async (text: string) => {
+			promptCalls.push(text);
 		},
-		abort: async (): Promise<void> => {
-			aborted = true;
-		},
-		setModel: async (): Promise<void> => {},
-		getActiveToolNames: () => [] as string[],
-		getAllTools: () => [] as ReturnType<AgentSession["getAllTools"]>,
-		getSteeringMessages: () => [] as readonly string[],
-		getFollowUpMessages: () => [] as readonly string[],
-		getAvailableThinkingLevels: () => [] as ReturnType<AgentSession["getAvailableThinkingLevels"]>,
-		abortCompaction: () => {},
-		abortBranchSummary: () => {},
-		abortRetry: () => {},
-		abortBash: () => {},
+		abort: async () => { aborted = true; },
+		setModel: async () => {},
+		getActiveToolNames: () => [],
 		getSessionStats: () => ({
 			sessionFile: undefined,
 			sessionId: "mock-session-id",
@@ -83,33 +98,27 @@ export function createMockSession(): MockSession {
 			outputTokens: 0,
 			totalCost: 0,
 		}),
-		getContextUsage: () => undefined,
-		getLastAssistantText: () => undefined,
-		getUserMessagesForForking: () => [],
 		aborted: false,
-		_messages: [] as unknown[],
-		get messages() {
-			return this._messages;
-		},
-		get state() {
-			return { messages: this._messages };
-		},
+		get messages() { return messages; },
+		get state() { return { messages }; },
 
-		// ── Test-control extras ──────────────────────────────────────────
-		_emit(event: AgentSessionEvent): void {
+		// ── Test-control extras ────────────────────────────────────────────
+		_emit(event: AgentSessionEvent) {
 			for (const fn of subscribers) fn(event);
 		},
-		_wasAborted(): boolean {
-			return aborted;
-		},
+		_wasAborted: () => aborted,
+		_promptCalls: promptCalls,
+		_messages: messages,
 	};
 
-	return session as unknown as MockSession;
+	return session;
 }
 
 /**
  * Creates a SessionFactory that always returns the same mock session.
  * Useful for testing normal (non-crashing) engine lifecycle.
+ *
+ * @returns `{ factory, session }` — session is fully typed with test extras.
  */
 export function mockSessionFactory(): {
 	factory: SessionFactory;
@@ -123,15 +132,16 @@ export function mockSessionFactory(): {
 /**
  * Creates a SessionFactory that fails N times then succeeds.
  * Useful for testing crash recovery and restart logic.
+ *
+ * @param opts.failCount - Number of times to throw before returning a session (default: 0)
+ * @param opts.failError - Error message to throw (default: generic message)
  */
 export function failingSessionFactory(opts: {
-	/** Number of times to throw before returning a valid session. */
 	failCount?: number;
-	/** Error message to throw. Defaults to generic message. */
 	failError?: string;
 } = {}): {
 	factory: SessionFactory;
-	get callCount(): number;
+	readonly callCount: number;
 	sessions: MockSession[];
 } {
 	let callCount = 0;
@@ -139,7 +149,7 @@ export function failingSessionFactory(opts: {
 
 	const factory: SessionFactory = async () => {
 		callCount++;
-		if (opts.failCount !== undefined && callCount <= opts.failCount) {
+		if (opts.failCount !== undefined && opts.failCount > 0 && callCount <= opts.failCount) {
 			throw new Error(opts.failError ?? `Session creation failed (attempt ${callCount})`);
 		}
 		const session = createMockSession();
@@ -149,9 +159,7 @@ export function failingSessionFactory(opts: {
 
 	return {
 		factory,
-		get callCount() {
-			return callCount;
-		},
+		get callCount() { return callCount; },
 		sessions,
 	};
 }
