@@ -90,7 +90,10 @@ describe("Readiness gate", () => {
 		// waitForShutdown waits for SIGINT/SIGTERM — mock it so tests can await
 		// handlePromise without hanging. The readiness-gate logic under test runs
 		// before waitForShutdown is reached, so this doesn't hide any assertions.
-		vi.spyOn(handler as any, "waitForShutdown").mockResolvedValue(undefined);
+		vi.spyOn(
+			handler as unknown as { waitForShutdown: () => Promise<void> },
+			"waitForShutdown",
+		).mockResolvedValue(undefined);
 	});
 
 	// vi.restoreAllMocks() removed — handled globally by vitest restoreMocks config

@@ -847,8 +847,9 @@ describe("Engine lifecycle (real server)", () => {
 			expect(getState().intentionalStop).toBe(true);
 			expect(getState().agentReady).toBe(false);
 
-			// Wait past the backoff period (2s for first crash)
-			await new Promise((r) => setTimeout(r, 2500));
+			// Wait past the backoff period (startEngine uses backoffBase:10, so 10ms is enough;
+			// use 100ms for safety margin)
+			await new Promise((r) => setTimeout(r, 100));
 
 			// Should still be stopped, not restarted
 			expect(getState().agentReady).toBe(false);
